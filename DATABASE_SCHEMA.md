@@ -71,15 +71,58 @@ CREATE TABLE questionnaires (
 
 ---
 
-### 3. `subscriptions`
-Tracks subscription and payment status for users.
+### 3. `payments`
+Tracks all payment transactions (registration fee, per-idea fee, meeting fees, etc.).
+
+```sql
+CREATE TABLE payments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  payment_type VARCHAR(100) NOT NULL CHECK (payment_type IN (
+    'registration_fee',
+    'idea_fee',
+    'meeting_consultation_fee',
+    'negotiation_activation_fee'
+  )),
+  related_idea_id UUID REFERENCES ideas(id) ON DELETE SET NULL, -- for idea_fee
+  related_meeting_id UUID REFERENCES meetings(id) ON DELETE SET NULL, -- for meeting_consultation_fee
+  amount NUMERIC(10, 2) NOT NULL,
+  currency VARCHAR(3) DEFAULT 'EUR',
+  status VARCHAR(50) DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'failed', 'refunded')),
+  stripe_payment_id VARCHAR(255), -- Stripe transaction ID (for future integration)
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+**Fields:**
+- `user_id` – user making the payment
+- `payment_type` – which fee (registration, per-idea, etc.)
+- `related_idea_id`, `related_meeting_id` – context (which idea/meeting this payment is for)
+- `amount` – payment amount
+- `currency` – currency code (default EUR)
+- `status` – 'pending' (awaiting processing), 'completed', 'failed', 'refunded'
+- `stripe_payment_id` – Stripe transaction ID (for Phase 5)
+- `created_at`, `updated_at` – timestamps
+
+**Notes:**
+- **For MVP:** Payments are mocked; we just create records with `status='completed'` to simulate payment.
+- **Registration fee:** Created when user signs up (one-time).
+- **Per-idea fee:** Created each time an Idea Holder creates an extra idea (after the 1st idea).
+- **Future fees** (meeting, negotiation) are added in Phase 5.
+- Actual Stripe integration happens in Phase 5.
+
+---
+
+### 4. `subscriptions`
+Tracks subscription plan and status (for future tier-based subscriptions in Phase 5).
 
 ```sql
 CREATE TABLE subscriptions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   plan VARCHAR(50) DEFAULT 'free' CHECK (plan IN ('free', 'basic', 'pro')),
-  status VARCHAR(50) DEFAULT 'inactive' CHECK (status IN ('active', 'inactive', 'suspended')),
+  status VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'suspended')),
   stripe_customer_id VARCHAR(255), -- Stripe customer ID (for future integration)
   current_period_start TIMESTAMP,
   current_period_end TIMESTAMP,
@@ -91,17 +134,16 @@ CREATE TABLE subscriptions (
 
 **Fields:**
 - `user_id` – the subscriber
-- `plan` – current plan tier (for future use; all users start on 'free')
-- `status` – 'active' = paid, 'inactive' = unpaid/free
-- `stripe_customer_id` – for future Stripe integration
+- `plan` – current plan tier ('free' for MVP, upgradeable later)
+- `status` – 'active' or 'inactive'
+- `stripe_customer_id` – Stripe customer ID (for Phase 5)
 - `current_period_start`, `current_period_end` – subscription period
 - `created_at`, `updated_at` – timestamps
 
 **Notes:**
-- **For MVP:** We track subscriptions in DB but mock payments.
-- **Registration fee:** User pays when signing up (mocked for now).
-- **Per-idea fee:** User pays when creating extra ideas (mocked for now).
-- Actual Stripe integration happens in Phase 5.
+- **For MVP:** All users start on 'free' plan.
+- Individual payments (registration, per-idea) are tracked in the `payments` table.
+- Tier-based subscriptions (if implemented) will update this table in Phase 5.
 
 ---
 
@@ -236,6 +278,8 @@ Scheduled pitch meetings between Idea Holder(s) and Investor(s).
 CREATE TABLE meetings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   idea_id UUID NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+  idea_holder_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  investor_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   scheduled_at TIMESTAMP NOT NULL,
   duration_minutes INT DEFAULT 60,
   status VARCHAR(50) DEFAULT 'scheduled' CHECK (status IN (
@@ -244,9 +288,9 @@ CREATE TABLE meetings (
     'completed',
     'cancelled'
   )),
-  meeting_room_link VARCHAR(500), -- Zoom / Daily.co room URL
-  meeting_room_type VARCHAR(50), -- 'daily_co', 'zoom', 'custom'
-  created_by_admin UUID REFERENCES users(id), -- admin who created the meeting
+  meeting_room_link VARCHAR(500), -- Daily.co room URL
+  meeting_room_type VARCHAR(50) DEFAULT 'daily_co',
+  created_by_admin UUID REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -254,18 +298,23 @@ CREATE TABLE meetings (
 
 **Fields:**
 - `idea_id` – the idea being pitched
+- `idea_holder_id` – the Idea Holder presenting (denormalized for easier querying)
+- `investor_id` – the Investor attending (for 1:1 meetings; for group meetings, see `meeting_attendees`)
 - `scheduled_at` – meeting start time
 - `duration_minutes` – meeting length (default 60 min)
 - `status` – 'scheduled' → 'in_progress' → 'completed' or 'cancelled'
-- `meeting_room_link` – Zoom/Daily.co URL (generated when meeting is created)
-- `meeting_room_type` – which provider
+- `meeting_room_link` – Daily.co room URL (generated when meeting is created)
+- `meeting_room_type` – provider type (default 'daily_co')
 - `created_by_admin` – admin user who scheduled the meeting
 - `created_at`, `updated_at` – timestamps
 
 **Notes:**
 - Only admins create meetings (no self-scheduling).
+- `idea_holder_id` and `investor_id` are denormalized in the `meetings` table for easier filtering and RLS policies.
+- `meeting_attendees` table still exists to support **multiple investors** in a single meeting (many-to-many).
+- For **1:1 meetings** (one investor, one idea holder), those are the only attendees.
 - Meeting room link is generated via Daily.co API when the meeting is created.
-- Idea Holder + matching investors are added to `meeting_attendees` table.
+- **RLS Policy:** Only the idea_holder_id, investor_id, and admins can see/join this meeting.
 
 ---
 
@@ -535,18 +584,19 @@ CREATE TABLE notifications (
 **Action:** Record in `agreements` table with `agreement_type='platform_terms'` and `status='agreed'`
 **Block:** User cannot proceed until checked
 
-### 2. **After Questionnaire → Questionnaire Acceptance Checkbox**
-**When:** User fills questionnaire and submits
-**Checkbox:** "I accept to share my questionnaire information with the platform for screening and matching"
-**Action:** Record in `agreements` table with `agreement_type='questionnaire_acceptance'` and `status='agreed'`
-**Block:** Questionnaire cannot be submitted until checked
-
-### 3. **Before Screening/Matching → NDA + Non-Circumvention Checkbox**
-**When:** Admin approves user (user status = 'approved')
+### 2. **After Questionnaire → NDA + Non-Circumvention Checkbox (BEFORE Admin Review)**
+**When:** User fills questionnaire and is about to submit
 **Checkbox:** "I accept the NDA and Non-Circumvention Agreement to protect confidentiality and platform integrity"
 **Action:** Record in `agreements` table with `agreement_type='nda_non_circumvention'` and `status='agreed'`
-**Block:** User cannot see the pool / dashboard until checked
-**Note:** This step happens after admin approves but before the user can interact with the pool.
+**Block:** Questionnaire cannot be submitted until checked
+**Note:** This happens before the admin sees the questionnaire, so the admin knows the user is committing to confidentiality before the admin reviews the content.
+
+### 3. **After Questionnaire Submission → Questionnaire Acceptance Checkbox**
+**When:** User submits questionnaire with NDA already signed
+**Checkbox:** "I accept that my questionnaire information will be reviewed by the platform admin for screening and matching"
+**Action:** Record in `agreements` table with `agreement_type='questionnaire_acceptance'` and `status='agreed'`
+**Block:** Questionnaire cannot be submitted until checked
+**Note:** Confirms user allows admin to review their questionnaire content.
 
 ### 4. **Before Pitch Meeting → Introduction / Consulting Agreement Checkbox**
 **When:** Admin schedules a meeting (attendees are notified)
@@ -557,64 +607,180 @@ CREATE TABLE notifications (
 
 ---
 
-## RLS (Row-Level Security) Policies – Summary
+## Table Relationships & Data Flow
 
-### `users` table
-- Users can read their own record
-- Admins can read all records
+### Meetings ↔ Meeting Attendees ↔ Messages
 
-### `ideas` table
-- Idea Holders see only their own ideas
-- Investors see approved ideas in the pool (via separate table or visibility flag)
-- Admins see all ideas
+**Structure:**
+- `meetings` table stores the basic meeting info (idea, idea_holder, investor, scheduled_at, status, room_link)
+- `meeting_attendees` is a **many-to-many join table** linking users to meetings (supports multiple investors in one meeting)
+- `messages` table stores chat messages; sender_id references the user, meeting_id references the meeting
 
-### `pitch_requests` table
-- Idea Holders see requests for their ideas
-- Investors see their own requests
-- Admins see all requests
+**Example Flow:**
+1. Admin creates a meeting: `INSERT INTO meetings (idea_id, idea_holder_id, investor_id, scheduled_at, ...)`
+2. Admin adds attendees: `INSERT INTO meeting_attendees (meeting_id, user_id, role)` for each investor + idea holder
+3. Users send chat messages: `INSERT INTO messages (meeting_id, sender_id, content)`
+4. RLS policy ensures only meeting attendees can read/write messages for that meeting
 
-### `messages` table
-- Only meeting attendees can read/write messages
-- No 1:1 investor-to-investor chats (enforced by checking meeting attendees)
-
-### `notes` table
-- Only Idea Holder + matching investors can read/write
-- Admins can read all
-
-### `task_votes` table
-- Investors can read/write their own votes
-- Idea Holder can read all votes for their idea
-- Admins can read all
-
-### Other tables
-- Admins can read all
-- Users can read their own records (and shared/associated records based on business logic)
+**Benefits:**
+- `meetings` table has idea_holder_id and investor_id for quick filtering (e.g., "show all meetings for user X")
+- `meeting_attendees` supports **both 1:1 and 1:many** meeting scenarios
+- `messages` are scoped to meeting_id, so RLS policies can be simple (check meeting membership)
 
 ---
 
-## Notes
+## RLS (Row-Level Security) Policies – SQL Examples
 
-1. **Denormalization for Performance:**
-   - `ideas.view_count`, `like_count`, `pitch_request_count` are denormalized (updated via triggers or application logic)
-   - This avoids expensive COUNT(*) queries on the mobile app
+### 1. `users` table – Users can read their own profile
 
-2. **Timestamps:**
-   - All tables have `created_at` and `updated_at` (except `likes`, `favorites`, which only have `created_at`)
-   - `updated_at` is useful for tracking changes and conflict resolution
+```sql
+CREATE POLICY "users_read_own" ON users
+  FOR SELECT
+  USING (auth.uid() = id);
 
-3. **Cascade Deletes:**
-   - When a user is deleted, all their related records (ideas, requests, votes, etc.) are deleted
-   - When an idea is deleted, all related records (meetings, messages, notes, etc.) are deleted
+CREATE POLICY "admin_read_all_users" ON users
+  FOR SELECT
+  USING (auth.role() = 'admin');
+```
 
-4. **Unique Constraints:**
-   - Help maintain data integrity (e.g., one questionnaire per user, one request per investor per idea)
+### 2. `ideas` table – Idea Holders see only their own; Investors see approved pool
 
-5. **Phase 5 Extensions:**
-   - Legal Advisor role + assignment table
-   - Negotiation workspace + documents
-   - Real Stripe subscription tracking
-   - Audit logs
-   - User blocking/suspending
+```sql
+CREATE POLICY "idea_holders_read_own_ideas" ON ideas
+  FOR SELECT
+  USING (
+    auth.uid() = owner_id
+    OR (
+      EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'investor')
+      AND status = 'screened'
+    )
+  );
+
+CREATE POLICY "admin_read_all_ideas" ON ideas
+  FOR SELECT
+  USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
+
+CREATE POLICY "idea_holders_create_ideas" ON ideas
+  FOR INSERT
+  WITH CHECK (
+    auth.uid() = owner_id
+    AND EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'idea_holder')
+  );
+```
+
+### 3. `messages` table – Only meeting attendees can read/write
+
+```sql
+CREATE POLICY "meeting_attendees_read_messages" ON messages
+  FOR SELECT
+  USING (
+    EXISTS (
+      SELECT 1 FROM meeting_attendees
+      WHERE meeting_attendees.meeting_id = messages.meeting_id
+      AND meeting_attendees.user_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "meeting_attendees_send_messages" ON messages
+  FOR INSERT
+  WITH CHECK (
+    sender_id = auth.uid()
+    AND EXISTS (
+      SELECT 1 FROM meeting_attendees
+      WHERE meeting_attendees.meeting_id = messages.meeting_id
+      AND meeting_attendees.user_id = auth.uid()
+    )
+  );
+```
+
+### 4. `meetings` table – Only attendees, idea_holder, and admin can see
+
+```sql
+CREATE POLICY "meeting_participants_read" ON meetings
+  FOR SELECT
+  USING (
+    auth.uid() = idea_holder_id
+    OR auth.uid() = investor_id
+    OR EXISTS (
+      SELECT 1 FROM meeting_attendees
+      WHERE meeting_attendees.meeting_id = meetings.id
+      AND meeting_attendees.user_id = auth.uid()
+    )
+    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+  );
+```
+
+### 5. `task_votes` table – Investors vote on their own; Idea Holder reads all
+
+```sql
+CREATE POLICY "investor_vote" ON task_votes
+  FOR INSERT
+  WITH CHECK (
+    investor_id = auth.uid()
+    AND EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'investor')
+  );
+
+CREATE POLICY "idea_holder_read_votes" ON task_votes
+  FOR SELECT
+  USING (
+    EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN ideas i ON t.idea_id = i.id
+      WHERE t.id = task_votes.task_id
+      AND i.owner_id = auth.uid()
+    )
+    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+  );
+```
+
+**Notes:**
+- RLS policies are **additive** – if ANY policy matches, the operation is allowed
+- `auth.uid()` is Supabase's built-in function to get the current user's ID
+- `auth.role()` can be used but typically we check `users.role` instead for flexibility
+- Admins can be given full access or specific access (we give full access here for MVP)
+
+---
+
+## Design Decisions & Clarifications
+
+### No Separate "Roles" Table
+- **Why?** Roles are stored directly in `users.role` as an enum ('idea_holder', 'investor', 'admin')
+- For MVP, this is simpler and sufficient. We don't need role permissions/inheritance.
+- If complex permission logic is needed later (Phase 5+), a separate `roles` + `role_permissions` table can be added.
+
+### Subscriptions vs Payments
+- **`subscriptions` table:** Tracks user's plan tier ('free', 'basic', 'pro') for future tier-based subscriptions (Phase 5)
+- **`payments` table:** Tracks individual transactions (registration fee, per-idea fee, etc.) – this is what MVP uses
+- For MVP, all users are on 'free' plan, but we record each payment transaction in `payments`
+
+### Denormalization for Performance
+- `ideas.view_count`, `like_count`, `pitch_request_count` are denormalized (updated via triggers or application logic)
+- `meetings.idea_holder_id` and `meetings.investor_id` are denormalized (also in `meeting_attendees`) for easier filtering and RLS
+- This avoids expensive COUNT(*) or JOIN queries on mobile app
+
+### Timestamps
+- All tables have `created_at` and `updated_at` (except `likes`, `favorites`, `meeting_attendees`, which only have `created_at`)
+- `updated_at` is useful for tracking changes and last-modified timestamps
+
+### Cascade Deletes
+- When a user is deleted, all their related records (ideas, requests, votes, messages, etc.) are deleted via CASCADE
+- When an idea is deleted, all related records (meetings, messages, notes, etc.) are deleted via CASCADE
+
+### Unique Constraints
+- Help maintain data integrity:
+  - One questionnaire per user
+  - One pitch request per investor per idea
+  - One like/favorite per investor per idea
+  - One vote per investor per task
+  - One subscription per user
+
+### Phase 5 Extensions
+- Legal Advisor role (currently manual, outside app)
+- Negotiation workspace + documents table
+- Real Stripe subscription + webhook handling
+- Audit logs (track user actions)
+- User blocking/suspending
+- Agreement e-signature integration (DocuSign, HelloSign)
 
 ---
 
