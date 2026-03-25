@@ -278,8 +278,6 @@ Scheduled pitch meetings between Idea Holder(s) and Investor(s).
 CREATE TABLE meetings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   idea_id UUID NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
-  idea_holder_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  investor_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   scheduled_at TIMESTAMP NOT NULL,
   duration_minutes INT DEFAULT 60,
   status VARCHAR(50) DEFAULT 'scheduled' CHECK (status IN (
@@ -298,8 +296,6 @@ CREATE TABLE meetings (
 
 **Fields:**
 - `idea_id` – the idea being pitched
-- `idea_holder_id` – the Idea Holder presenting (denormalized for easier querying)
-- `investor_id` – the Investor attending (for 1:1 meetings; for group meetings, see `meeting_attendees`)
 - `scheduled_at` – meeting start time
 - `duration_minutes` – meeting length (default 60 min)
 - `status` – 'scheduled' → 'in_progress' → 'completed' or 'cancelled'
@@ -310,49 +306,74 @@ CREATE TABLE meetings (
 
 **Notes:**
 - Only admins create meetings (no self-scheduling).
-- `idea_holder_id` and `investor_id` are denormalized in the `meetings` table for easier filtering and RLS policies.
-- `meeting_attendees` table still exists to support **multiple investors** in a single meeting (many-to-many).
-- For **1:1 meetings** (one investor, one idea holder), those are the only attendees.
+- Meetings are simple: idea + scheduled time + video room.
+- Attendees are tracked separately via `chat_rooms` (meeting-specific chatroom with meeting_id reference).
 - Meeting room link is generated via Daily.co API when the meeting is created.
-- **RLS Policy:** Only the idea_holder_id, investor_id, and admins can see/join this meeting.
 
 ---
 
-### 9. `meeting_attendees`
-Join table linking users to meetings.
+### 9. `chat_rooms`
+Chat groups for coordination and discussion, optionally tied to a meeting.
 
 ```sql
-CREATE TABLE meeting_attendees (
+CREATE TABLE chat_rooms (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  meeting_id UUID NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role VARCHAR(50) NOT NULL CHECK (role IN ('idea_holder', 'investor')),
-  status VARCHAR(50) DEFAULT 'invited' CHECK (status IN ('invited', 'accepted', 'declined', 'attended')),
+  idea_id UUID NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+  meeting_id UUID REFERENCES meetings(id) ON DELETE SET NULL, -- NULL = general chat, NOT NULL = meeting-specific chat
+  created_by_admin UUID NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+  status VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'archived')),
   created_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(meeting_id, user_id) -- one attendee record per user per meeting
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 ```
 
 **Fields:**
-- `meeting_id`, `user_id` – meeting and attendee
-- `role` – 'idea_holder' or 'investor'
-- `status` – 'invited' (default), 'accepted', 'declined', 'attended'
-- `created_at` – timestamp
+- `idea_id` – the idea this chatroom is for
+- `meeting_id` – if NULL: general coordination/discussion chatroom; if NOT NULL: chat tied to specific meeting
+- `created_by_admin` – admin who opened this chatroom
+- `status` – 'active' or 'archived'
+- `created_at`, `updated_at` – timestamps
 
 **Notes:**
-- Admin adds attendees when creating the meeting.
-- Attendees receive notifications about the meeting.
-- Investors can only join if they're in this table.
+- Admin can open a chatroom **anytime, for any reason** (timing coordination, feedback, follow-up, etc.)
+- If `meeting_id` is NOT NULL, this is a meeting-specific chatroom (before/during/after the meeting)
+- Admin is always present in chatrooms (enforced by adding admin to `chat_room_attendees`)
 
 ---
 
-### 10. `messages`
-Chat messages for group discussions within a meeting.
+### 10. `chat_room_attendees`
+Join table linking users to chatrooms.
+
+```sql
+CREATE TABLE chat_room_attendees (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  chat_room_id UUID NOT NULL REFERENCES chat_rooms(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role VARCHAR(50) NOT NULL CHECK (role IN ('idea_holder', 'investor', 'admin')),
+  joined_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(chat_room_id, user_id) -- one record per user per chatroom
+);
+```
+
+**Fields:**
+- `chat_room_id`, `user_id` – chatroom and participant
+- `role` – 'idea_holder', 'investor', or 'admin'
+- `joined_at` – timestamp
+
+**Notes:**
+- Admin is always in the chatroom (enforced by app logic when creating chatroom).
+- Only attendees can see and send messages in this chatroom.
+- Ensures investors can't communicate 1:1 (admin is always present).
+
+---
+
+### 11. `messages`
+Chat messages within a chatroom.
 
 ```sql
 CREATE TABLE messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  meeting_id UUID NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  chat_room_id UUID NOT NULL REFERENCES chat_rooms(id) ON DELETE CASCADE,
   sender_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   content TEXT NOT NULL,
   created_at TIMESTAMP DEFAULT NOW()
@@ -360,15 +381,15 @@ CREATE TABLE messages (
 ```
 
 **Fields:**
-- `meeting_id` – the meeting group chat
+- `chat_room_id` – the chatroom this message belongs to
 - `sender_id` – the user sending the message
 - `content` – message text
 - `created_at` – timestamp
 
 **Notes:**
-- Messages are scoped to a meeting (and thus to the idea + matching participants).
-- RLS policy: Only meeting attendees can read/write messages.
-- No 1:1 investor-to-investor chats (enforced by RLS or app logic).
+- Messages are scoped to a chatroom (general or meeting-specific).
+- RLS policy: Only chatroom attendees can read/write messages.
+- No 1:1 investor-to-investor chats (enforced by admin always being present in chatroom).
 
 ---
 
@@ -609,23 +630,34 @@ CREATE TABLE notifications (
 
 ## Table Relationships & Data Flow
 
-### Meetings ↔ Meeting Attendees ↔ Messages
+### Meetings ↔ Chat Rooms ↔ Messages
 
 **Structure:**
-- `meetings` table stores the basic meeting info (idea, idea_holder, investor, scheduled_at, status, room_link)
-- `meeting_attendees` is a **many-to-many join table** linking users to meetings (supports multiple investors in one meeting)
-- `messages` table stores chat messages; sender_id references the user, meeting_id references the meeting
+- `meetings` table stores basic meeting info (idea, scheduled_at, status, room_link)
+- `chat_rooms` table can be **general** (no meeting) or **meeting-specific** (linked to meeting)
+- `chat_room_attendees` is a **many-to-many join table** linking users to chatrooms
+- `messages` table stores chat messages; tied to `chat_room_id`
 
-**Example Flow:**
-1. Admin creates a meeting: `INSERT INTO meetings (idea_id, idea_holder_id, investor_id, scheduled_at, ...)`
-2. Admin adds attendees: `INSERT INTO meeting_attendees (meeting_id, user_id, role)` for each investor + idea holder
-3. Users send chat messages: `INSERT INTO messages (meeting_id, sender_id, content)`
-4. RLS policy ensures only meeting attendees can read/write messages for that meeting
+**Example Flow 1 – General Coordination Chatroom:**
+1. Admin opens a chatroom: `INSERT INTO chat_rooms (idea_id, meeting_id=NULL, created_by_admin=admin_id)`
+2. Admin adds attendees: `INSERT INTO chat_room_attendees (chat_room_id, user_id, role)` for idea_holder + investors + admin
+3. Users chat: `INSERT INTO messages (chat_room_id, sender_id, content)` ("What time works?", "Tuesday at 3?", etc.)
+4. Once time is agreed, admin creates a meeting: `INSERT INTO meetings (idea_id, scheduled_at, ...)`
+
+**Example Flow 2 – Meeting-Specific Chatroom:**
+1. Admin creates a meeting: `INSERT INTO meetings (idea_id, scheduled_at, meeting_room_link, status='scheduled')`
+2. Admin opens a meeting chatroom: `INSERT INTO chat_rooms (idea_id, meeting_id=meeting.id, created_by_admin=admin_id)`
+3. Admin adds same attendees (idea_holder + investors + admin)
+4. Users chat before/during/after meeting: `INSERT INTO messages (chat_room_id, sender_id, content)`
+5. Meeting happens at scheduled_at time
+6. Chat continues for follow-up discussion
 
 **Benefits:**
-- `meetings` table has idea_holder_id and investor_id for quick filtering (e.g., "show all meetings for user X")
-- `meeting_attendees` supports **both 1:1 and 1:many** meeting scenarios
-- `messages` are scoped to meeting_id, so RLS policies can be simple (check meeting membership)
+- `meetings` is simple (just scheduling, no attendee denormalization)
+- `chat_rooms` is flexible (general OR meeting-specific)
+- Admin is always present in chats (enforced at app level)
+- Messages are scoped to `chat_room_id`, making RLS policies simple
+- Can have multiple chatrooms per idea (coordination, follow-up, feedback, etc.)
 
 ---
 
@@ -668,49 +700,83 @@ CREATE POLICY "idea_holders_create_ideas" ON ideas
   );
 ```
 
-### 3. `messages` table – Only meeting attendees can read/write
+### 3. `chat_rooms` table – All users can read room info, but admins control access
 
 ```sql
-CREATE POLICY "meeting_attendees_read_messages" ON messages
+CREATE POLICY "chatroom_participants_read" ON chat_rooms
   FOR SELECT
   USING (
     EXISTS (
-      SELECT 1 FROM meeting_attendees
-      WHERE meeting_attendees.meeting_id = messages.meeting_id
-      AND meeting_attendees.user_id = auth.uid()
-    )
-  );
-
-CREATE POLICY "meeting_attendees_send_messages" ON messages
-  FOR INSERT
-  WITH CHECK (
-    sender_id = auth.uid()
-    AND EXISTS (
-      SELECT 1 FROM meeting_attendees
-      WHERE meeting_attendees.meeting_id = messages.meeting_id
-      AND meeting_attendees.user_id = auth.uid()
-    )
-  );
-```
-
-### 4. `meetings` table – Only attendees, idea_holder, and admin can see
-
-```sql
-CREATE POLICY "meeting_participants_read" ON meetings
-  FOR SELECT
-  USING (
-    auth.uid() = idea_holder_id
-    OR auth.uid() = investor_id
-    OR EXISTS (
-      SELECT 1 FROM meeting_attendees
-      WHERE meeting_attendees.meeting_id = meetings.id
-      AND meeting_attendees.user_id = auth.uid()
+      SELECT 1 FROM chat_room_attendees
+      WHERE chat_room_attendees.chat_room_id = chat_rooms.id
+      AND chat_room_attendees.user_id = auth.uid()
     )
     OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
   );
 ```
 
-### 5. `task_votes` table – Investors vote on their own; Idea Holder reads all
+### 4. `chat_room_attendees` table – Admin can manage, users can see themselves
+
+```sql
+CREATE POLICY "users_read_own_attendance" ON chat_room_attendees
+  FOR SELECT
+  USING (
+    user_id = auth.uid()
+    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+  );
+
+CREATE POLICY "admin_manage_attendees" ON chat_room_attendees
+  FOR INSERT
+  WITH CHECK (
+    EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+  );
+```
+
+### 5. `messages` table – Only chatroom attendees can read/write
+
+```sql
+CREATE POLICY "chatroom_participants_read_messages" ON messages
+  FOR SELECT
+  USING (
+    EXISTS (
+      SELECT 1 FROM chat_room_attendees
+      WHERE chat_room_attendees.chat_room_id = messages.chat_room_id
+      AND chat_room_attendees.user_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "chatroom_participants_send_messages" ON messages
+  FOR INSERT
+  WITH CHECK (
+    sender_id = auth.uid()
+    AND EXISTS (
+      SELECT 1 FROM chat_room_attendees
+      WHERE chat_room_attendees.chat_room_id = messages.chat_room_id
+      AND chat_room_attendees.user_id = auth.uid()
+    )
+  );
+```
+
+### 6. `meetings` table – Admin can see all, others see meetings they're invited to
+
+```sql
+CREATE POLICY "admin_read_all_meetings" ON meetings
+  FOR SELECT
+  USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
+
+CREATE POLICY "users_see_meetings_via_chatroom" ON meetings
+  FOR SELECT
+  USING (
+    EXISTS (
+      SELECT 1 FROM chat_rooms cr
+      JOIN chat_room_attendees cra ON cr.chat_room_id = cra.chat_room_id
+      WHERE cr.meeting_id = meetings.id
+      AND cra.user_id = auth.uid()
+    )
+  );
+```
+
+### 7. `task_votes` table – Investors vote on their own; Idea Holder reads all
 
 ```sql
 CREATE POLICY "investor_vote" ON task_votes
@@ -790,14 +856,16 @@ CREATE POLICY "idea_holder_read_votes" ON task_votes
 |-------|---------|---|
 | `users` | Platform users (Idea Holders, Investors, Admins) | Primary key for all user-related tables |
 | `questionnaires` | User profile questionnaire responses | Linked to `users` |
-| `subscriptions` | Subscription & payment status | Linked to `users` |
+| `payments` | Payment transactions (registration, per-idea, etc.) | Linked to `users` + `ideas` / `meetings` |
+| `subscriptions` | Subscription plan & status (for Phase 5) | Linked to `users` |
 | `ideas` | Ideas posted by Idea Holders | Linked to `users` (owner) |
 | `pitch_requests` | Investor requests to pitch | Linked to `ideas` + `users` (investor) |
 | `likes` | Investors liking ideas without pitching | Linked to `ideas` + `users` (investor) |
 | `favorites` | Investors saving ideas | Linked to `ideas` + `users` (investor) |
 | `meetings` | Scheduled pitch meetings | Linked to `ideas` |
-| `meeting_attendees` | Users attending meetings | Linked to `meetings` + `users` |
-| `messages` | Chat messages in meetings | Linked to `meetings` + `users` (sender) |
+| `chat_rooms` | Chat groups (general or meeting-specific) | Linked to `ideas` + `meetings` (optional) |
+| `chat_room_attendees` | Users in chatrooms | Linked to `chat_rooms` + `users` |
+| `messages` | Chat messages in chatrooms | Linked to `chat_rooms` + `users` (sender) |
 | `notes` | Shared notes per idea | Linked to `ideas` + `users` (creator) |
 | `agreements` | Agreement acceptance tracking | Linked to `users` |
 | `tasks` | Post-meeting tasks (voting) | Linked to `meetings` + `ideas` |
