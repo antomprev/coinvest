@@ -1,0 +1,25 @@
+{
+  "name": "coinvest",
+  "version": "1.0.0",
+  "description": "Coinvest - Investment matching platform",
+  "private": true,
+  "scripts": {
+    "start": "cd backend && npm start",
+    "dev": "cd backend && npm start",
+    "backend": "cd backend && npm install && npm start",
+    "mobile": "cd mobile && npm install && npm start",
+    "mobile:web": "cd mobile && npm start -- --web",
+    "mobile:ios": "cd mobile && npm start -- --ios",
+    "mobile:android": "cd mobile && npm start -- --android",
+    "install:all": "npm install && cd backend && npm install && cd ../mobile && npm install && cd ..",
+    "build": "cd backend && npm install"
+  },
+  "keywords": [
+    "investment",
+    "startups",
+    "matching",
+    "platform"
+  ],
+  "author": "",
+  "license": "ISC"
+}
