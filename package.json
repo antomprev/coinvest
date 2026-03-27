@@ -4,6 +4,7 @@
   "description": "Coinvest - Investment matching platform",
   "private": true,
   "scripts": {
+    "postinstall": "cd backend && npm install",
     "start": "cd backend && npm start",
     "dev": "cd backend && npm start",
     "backend": "cd backend && npm install && npm start",
